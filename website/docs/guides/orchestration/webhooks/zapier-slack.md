@@ -54,7 +54,7 @@ In the **Set up action** area, add two items to **Input Data**: `raw_body` and `
 
 In the **Code** field, paste the following code, replacing `YOUR_SECRET_HERE` with the secret you created when setting up the Storage by Zapier integration. Remember that this is not your dbt Cloud secret.
 
-The code below will validate the authenticity of the request, extract the run logs for the completed job from the Admin API, and then build a summary message that pulls out any error messages from the end-of-invocation logs created by dbt Core.
+The code below will validate the authenticity of the request, extract the run logs for the completed job from the Admin API, and then build two messages: a summary message containing the outcome of each step and its duration, and a message for inclusion in a thread displaying any error messages extracted from the end-of-invocation logs created by dbt Core.
 
 ```python
 import hashlib
@@ -95,28 +95,26 @@ run_data_response.raise_for_status()
 run_data_results = run_data_response.json()['data']
 
 # Overall run summary
-summary_message = f"""
+step_summary_post = f"""
 *\[{hook_data['runStatus']} for Run #{run_id} on Job \"{hook_data['jobName']}\"]({run_data_results['href']})*
 
 *Environment:* {hook_data['environmentName']} | *Trigger:* {hook_data['runReason']} | *Duration:* {run_data_results['duration_humanized']}
 
 """
 
-threaded_error_messages = ""
+threaded_errors_post = ""
 
 # Step-specific summaries
 for step in run_data_results['run_steps']:
   if step['status_humanized'] == 'Success':
-    summary_message += f"""
+    step_summary_post += f"""
 ✅ {step['name']} ({step['status_humanized']} in {step['duration_humanized']})
 """
   else:
-    summary_message += f"""
+    step_summary_post += f"""
 ❌ {step['name']} ({step['status_humanized']} in {step['duration_humanized']})
 """
-    threaded_error_messages += f"""
-*{step['name']}*
-"""
+
     # Don't try to extract info from steps that don't have well-formed logs
     show_logs = not any(cmd in step['name'] for cmd in commands_to_skip_logs)
     if show_logs:
@@ -127,34 +125,145 @@ for step in run_data_results['run_steps']:
       summary_start = re.search('(?:Completed with \d+ errors? and \d+ warnings?:|Database Error|Compilation Error)', full_log)
     
       line_items = re.findall('(^.*(?:Failure|Error) in .*\n.*\n.*)', full_log, re.MULTILINE)
-    
+
+      if not summary_start:
+        continue
+      
+      threaded_errors_post += f"""
+*{step['name']}*
+"""    
+      # If there are no line items, the failure wasn't related to dbt nodes, and we want the whole rest of the message. 
+      # If there are, then we just want the summary line and then to log out each individual node's error.
       if len(line_items) == 0:
-        relevant_log = f'```{full_log[summary_start.start() if summary_start else 0:]}```'
+        relevant_log = f'```{full_log[summary_start.start():]}```'
       else:
         relevant_log = summary_start[0]
         for item in line_items:
           relevant_log += f'\n```\n{item.strip()}\n```\n'
-      threaded_error_messages += f"""
+      threaded_errors_post += f"""
 {relevant_log}
 """
 
+send_error_thread = len(threaded_errors_post) > 0
+
 # Zapier looks for the `output` dictionary for use in subsequent steps
-output = {'summary_message': summary_message, 'threaded_error_messages': threaded_error_messages}
+output = {'step_summary_post': step_summary_post, 'send_error_thread': send_error_thread, 'threaded_errors_post': threaded_errors_post}
 ```
 
-### 6. Add the Microsoft Teams action
-Select **Microsoft Teams** as the App, and **Send Channel Message** as the Action.
+### 5. Add Slack actions in Zapier
+Select **Slack** as the App, and **Send Channel Message** as the Action.
 
-In the **Set up action** area, choose the team and channel. Set the **Message Text Format** to **markdown**, then put **2. Outcome Message** from the Run Python in Code by Zapier output into the **Message Text** field. 
+In the **Set up action** area, choose the channel to post to. Set the **Message Text** field to **2. Step Summary Post** from the Run Python in Code by Zapier output.
 
-![Screenshot of the Zapier UI, showing the mappings of prior steps to an MS Teams message](/img/guides/orchestration/webhooks/zapier-ms-teams/ms-teams-zap-config.png)
+Configure the other options as you see fit (e.g. choosing a Bot name and Bot Icon). 
+
+![Screenshot of the Zapier UI, showing the mappings of prior steps to a Slack message](/img/guides/orchestration/webhooks/zapier-slack/parent-slack-config.png)
+
+Add another step, **Filter**. Set the **Field** to **2. Send Error Thread** and the **condition** to **(Boolean) Is true**. This prevents the error that arises if you try to send an empty Slack message in the next step, which summarises the errors. 
+
+![Screenshot of the Zapier UI, showing the correctly configured Filter step](/img/guides/orchestration/webhooks/zapier-slack/filter-config.png)
+
+Add another **Send Channel Message in Slack** action. In the **Set up action** area, choose the same channel as last time, but set the **Message Text** to **2. Threaded Errors Post** from the same Run Python step. Set the **Thread** value to **3. Message Ts**, the timestamp of the post created by the first Slack action. This tells Zapier to add this post as a threaded reply to the main message, which prevents the full (potentially long) output from cluttering your channel. 
+
+![Screenshot of the Zapier UI, showing the mappings of prior steps to a Slack message](/img/guides/orchestration/webhooks/zapier-slack/thread-slack-config.png)
 
 ### 7. Test and deploy
-As you have gone through each step, you should have tested the outputs, so you can now try posting a message into your Teams channel. 
 
-When you're happy with it, remember to ensure that your `run_id` and `account_id` are no longer hardcoded, then publish your Zap.
+When you're happy with your Zap, remember to ensure that your `run_id` and `account_id` are no longer hardcoded in the Code step, then publish your Zap.
 
-## Other notes
-- If you post to a chat instead of a team channel, you don't need to add the Zapier app to Microsoft Teams.
-- If you post to a chat instead of a team channel, note that markdown is not supported and you will need to remove the markdown formatting. 
-- If you chose the **Catch Hook** trigger instead of **Catch Raw Hook**, you will need to pass each required property from the webhook as an input instead of running `json.loads()` against the raw body. You will also need to remove the validation code. 
+## Alternate approach
+
+Instead of using a webhook as your trigger, you can keep the existing dbt Cloud app installed in your Slack workspace and use its messages being posted to your channel as the trigger. In this case, you can skip validating the webhook and only need to load the context from the thread. 
+
+### 1. Create a new Zap in Zapier
+Use **Slack** as the initiating app, and **New Message Posted to Channel** as the Trigger. In the **Trigger** configuration area, pick the channel where your Slack alerts are posted, and set **Trigger for Bot Messages?** to **Yes**.
+
+![Screenshot of the Zapier UI, showing the correctly configured Message trigger step](/img/guides/orchestration/webhooks/zapier-slack/message-trigger-config.png)
+
+Test your Zap to find an example record. You may need to load additional samples until you get one which relates to a failed job, depending on whether you post all job events to Slack or not. 
+
+### 2. Add a Filter step
+Add a **Filter** step with the following conditions: 
+- **1. Text contains failed on Job**
+- **1. User Is Bot Is true**
+- **1. User Name Exactly matches dbt Cloud**
+
+![Screenshot of the Zapier UI, showing the correctly configured Filter step](/img/guides/orchestration/webhooks/zapier-slack/message-trigger-filter.png)
+
+### 3. Extract the Run ID 
+Add a **Format** step with the **Event** of **Text**, and the Action **Extract Number**. For the **Input**, select **1. Text**. 
+
+![Screenshot of the Zapier UI, showing the Transform step configured to extract a number from the Slack message's Text property](/img/guides/orchestration/webhooks/zapier-slack/extract-number.png)
+
+Test your step and validate that the run ID has been correctly extracted.
+
+### 4. Add a Delay
+Sometimes dbt Cloud posts the message about the run failing before the run's artifacts are available through the API. For this reason, it's recommended to add a brief delay to increase the likelihood that the data is available. On certain plans, Zapier will automatically retry a job which fails due to a 404 error, but its standdown period is longer than is normally necessary so the context will be missing from your thread for longer. 
+
+A 1 minute delay is generally enough. 
+
+### 5. Store secrets
+In the next step, you will need a dbt Cloud [user token](https://docs.getdbt.com/docs/dbt-cloud-apis/user-tokens) or [service account token](https://docs.getdbt.com/docs/dbt-cloud-apis/service-tokens). 
+
+Zapier allows you to [store secrets](https://help.zapier.com/hc/en-us/articles/8496293271053-Save-and-retrieve-data-from-Zaps), which prevents your keys from being displayed in plaintext in the Zap code. You will be able to access them via the [StoreClient utility](https://help.zapier.com/hc/en-us/articles/8496293969549-Store-data-from-code-steps-with-StoreClient).
+
+### 6. Add a Code action
+
+Select **Code by Zapier** as the App, and **Run Python** as the Event. 
+
+This step is very similar to the one described above, but can skip a lot of the initial validation work. 
+
+In the **Code** field, paste the following code, replacing `YOUR_SECRET_HERE` with the secret you created when setting up the Storage by Zapier integration. Remember that this is not your dbt Cloud secret.
+
+The code below will validate the authenticity of the request, extract the run logs for the completed job from the Admin API, and then build two messages: a summary message containing the outcome of each step and its duration, and a message for inclusion in a thread displaying any error messages extracted from the end-of-invocation logs created by dbt Core.
+
+
+TODO: The indentation on this is a catastrophe
+```python
+import re
+
+api_token = 'dbts_sJNgFVA1QSMWPwBENjmQUOGeKVGPTEKAlEks8AYwA-v2VLYoWU3F1j7Q=='
+# Steps derived from these commands won't have their error details shown inline, as they're messy
+commands_to_skip_logs = ['dbt source', 'dbt docs']
+run_id = input_data['run_id']
+account_id = input_data['account_id']
+url = f'https://cloud.getdbt.com/api/v2/accounts/{account_id}/runs/{run_id}/?include_related=["run_steps"]'
+headers = {'Authorization': f'Token {api_token}'}
+
+response = requests.get(url, headers=headers)
+response.raise_for_status()
+results = response.json()['data']
+
+threaded_errors_post = ""
+for step in results['run_steps']:
+  show_logs = not any(cmd in step['name'] for cmd in commands_to_skip_logs)
+  if not show_logs:
+    continue
+  if step['status_humanized'] != 'Success':
+    full_log = step['logs']
+    # Remove timestamp and any colour tags
+    full_log = re.sub('\x1b?\[[0-9]+m[0-9:]*', '', full_log)
+    
+      summary_start = re.search('(?:Completed with \d+ errors? and \d+ warnings?:|Database Error|Compilation Error)', full_log)
+    
+    line_items = re.findall('(^.*(?:Failure|Error) in .*\n.*\n.*)', full_log, re.MULTILINE)
+      if not summary_start:
+        continue
+      
+      threaded_errors_post += f"""
+*{step['name']}*
+"""    
+    # If there are no line items, the failure wasn't related to dbt nodes, and we want the whole rest of the message. 
+    # If there are, then we just want the summary line and then to log out each individual node's error.
+    if len(line_items) == 0:
+      relevant_log = f'```{full_log[summary_start.start():]}```'
+    else:
+      relevant_log = summary_start[0]
+      for item in line_items:
+        relevant_log += f'\n```\n{item.strip()}\n```\n'
+      threaded_errors_post += f"""
+{relevant_log}
+"""
+
+output = {'threaded_errors_post': threaded_errors_post}
+```
